@@ -30,6 +30,18 @@ def test_to_json_valid_json():
         assert "nodes" in data
         assert "links" in data
 
+
+def test_to_json_includes_graph_schema_metadata(tmp_path):
+    G = make_graph()
+    out = tmp_path / "graph.json"
+
+    assert to_json(G, {}, str(out))
+
+    graph_metadata = json.loads(out.read_text())["graph"]
+    assert graph_metadata["schema_version"] == 1
+    assert graph_metadata["graphify_version"]
+
+
 def test_to_json_nodes_have_community():
     G = make_graph()
     communities = cluster(G)
@@ -39,6 +51,153 @@ def test_to_json_nodes_have_community():
         data = json.loads(out.read_text())
         for node in data["nodes"]:
             assert "community" in node
+
+
+def test_to_json_sorts_graph_collections_across_insertion_order(tmp_path):
+    import networkx as nx
+
+    nodes = [("b", {"label": "Beta"}), ("a", {"label": "Alpha"}), ("c", {"label": "Gamma"})]
+    links = [
+        ("b", "c", {"relation": "uses", "_src": "b", "_tgt": "c"}),
+        ("a", "b", {"relation": "calls", "_src": "a", "_tgt": "b"}),
+    ]
+    hyperedges = [
+        {"id": "h2", "nodes": ["b", "c"]},
+        {"id": "h1", "nodes": ["a", "b"]},
+    ]
+
+    def make_graph(reverse=False):
+        graph = nx.Graph()
+        graph.add_nodes_from(reversed(nodes) if reverse else nodes)
+        graph.add_edges_from(reversed(links) if reverse else links)
+        graph.graph["hyperedges"] = list(reversed(hyperedges)) if reverse else hyperedges
+        return graph
+
+    outputs = [tmp_path / "first.json", tmp_path / "second.json"]
+    for output, reverse in zip(outputs, (False, True)):
+        assert to_json(
+            make_graph(reverse),
+            {0: ["a", "b"], 1: ["c"]},
+            str(output),
+            built_at_commit="fixed",
+        )
+
+    assert outputs[0].read_bytes() == outputs[1].read_bytes()
+
+
+def test_to_json_field_order_stable_across_read_rebuild(tmp_path):
+    """graph.json survives a build -> write -> read-back -> write round-trip
+    byte-for-byte. node_link_data always appends the node key (`id`) last, so a
+    node whose `id` was an inline attribute on a cold build lands mid-dict, while
+    the same node after build_from_json consumes `id` as the pure node key lands
+    last — identical values, churned field order. Emitting a canonical key order
+    keeps the two serializations identical. Regression guard: the earlier
+    determinism test only varied insertion order within one build and missed
+    this."""
+    extraction = {
+        "nodes": [
+            {"id": "a_foo", "label": "foo", "file_type": "code", "source_file": "a.py"},
+            {"id": "b_bar", "label": "bar", "file_type": "code", "source_file": "b.py"},
+            {"id": "c_baz", "label": "baz", "file_type": "code", "source_file": "c.py"},
+        ],
+        "edges": [
+            {"source": "a_foo", "target": "b_bar", "relation": "calls",
+             "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "a.py"},
+            {"source": "b_bar", "target": "c_baz", "relation": "references",
+             "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "b.py"},
+        ],
+        "hyperedges": [],
+    }
+    communities = {0: ["a_foo", "b_bar", "c_baz"]}
+
+    first = tmp_path / "first.json"
+    to_json(build_from_json(extraction), communities, str(first),
+            built_at_commit="fixed", force=True)
+    reread = json.loads(first.read_text())
+
+    second = tmp_path / "second.json"
+    to_json(build_from_json(reread), communities, str(second),
+            built_at_commit="fixed", force=True)
+
+    # Byte-identity is the strongest statement of "no cosmetic churn".
+    assert first.read_bytes() == second.read_bytes()
+
+    data = json.loads(first.read_text())
+    # `id` leads every node; source/target lead every link — the identity-first
+    # order node_link_data does not guarantee on its own.
+    for node in data["nodes"]:
+        assert list(node.keys())[0] == "id"
+    for link in data["links"]:
+        assert list(link.keys())[:2] == ["source", "target"]
+    # Endpoints are never swapped by the reordering.
+    endpoints = sorted((e["source"], e["target"]) for e in data["links"])
+    assert endpoints == [("a_foo", "b_bar"), ("b_bar", "c_baz")]
+
+
+def test_to_json_field_order_stable_with_non_ascii_labels(tmp_path):
+    """The byte-identity guarantee must hold with non-ASCII labels — the fix's
+    round-trip stability implicitly relies on the ensure_ascii write path, and a
+    reordered dict with escaped-unicode values must still serialize identically."""
+    extraction = {
+        "nodes": [
+            {"id": "a_cafe", "label": "café", "file_type": "code", "source_file": "a.py"},
+            {"id": "b_ja", "label": "日本語クラス", "file_type": "code", "source_file": "b.py"},
+        ],
+        "edges": [
+            {"source": "a_cafe", "target": "b_ja", "relation": "references",
+             "confidence": "INFERRED", "confidence_score": 0.55, "source_file": "a.py"},
+        ],
+        "hyperedges": [],
+    }
+    communities = {0: ["a_cafe", "b_ja"]}
+    first = tmp_path / "first.json"
+    to_json(build_from_json(extraction), communities, str(first),
+            built_at_commit="fixed", force=True)
+    reread = json.loads(first.read_text())
+    second = tmp_path / "second.json"
+    to_json(build_from_json(reread), communities, str(second),
+            built_at_commit="fixed", force=True)
+    assert first.read_bytes() == second.read_bytes(), "non-ASCII round-trip churned field order"
+    # the reorder preserves the non-ASCII value
+    labels = {n["id"]: n.get("label") for n in json.loads(first.read_text())["nodes"]}
+    assert labels.get("b_ja") == "日本語クラス"
+
+
+def test_to_json_commit_fallback_uses_output_repo_not_cwd(tmp_path, monkeypatch):
+    # Without an explicit built_at_commit, provenance must come from the repo
+    # the graph is written into, not from whatever repo the shell happens to
+    # be in — running `graphify extract <target>` from another repo's root
+    # used to stamp the invoker's HEAD into the target's graph.json.
+    import subprocess
+    import networkx as nx
+
+    def git(cwd, *args):
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            cwd=cwd, check=True, capture_output=True,
+        )
+
+    target = tmp_path / "target"
+    (target / "graphify-out").mkdir(parents=True)
+    git(target, "init")
+    git(target, "commit", "--allow-empty", "-m", "target")
+    target_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=target, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    invoker = tmp_path / "invoker"
+    invoker.mkdir()
+    git(invoker, "init")
+    git(invoker, "commit", "--allow-empty", "-m", "invoker")
+    monkeypatch.chdir(invoker)
+
+    G = nx.Graph()
+    G.add_node("n1", label="n1")
+    out = target / "graphify-out" / "graph.json"
+    assert to_json(G, {0: ["n1"]}, str(out), force=True)
+    assert json.loads(out.read_text())["built_at_commit"] == target_head
+
 
 def test_to_cypher_creates_file():
     G = make_graph()
@@ -99,6 +258,48 @@ def test_to_graphml_tolerates_none_attribute_values():
         content = out.read_text()
         assert "<graphml" in content
 
+def test_to_graphml_tolerates_dict_and_list_attribute_values():
+    """nx.write_graphml only accepts scalars; a dict/list attribute (per-node
+    metadata, or the graph-level hyperedges list) used to crash the whole export.
+    to_graphml must JSON-serialize them across graph/node/edge scopes (#1831)."""
+    import networkx as nx
+    G = make_graph()
+    communities = cluster(G)
+    a_node = next(iter(G.nodes()))
+    G.nodes[a_node]["metadata"] = {"kind": "file", "size": 12}
+    G.nodes[a_node]["tags"] = ["x", "y"]
+    if G.number_of_edges():
+        u, v = next(iter(G.edges()))
+        G.edges[u, v]["ctx"] = {"k": "v"}
+    G.graph["hyperedges"] = [{"nodes": [a_node], "label": "h"}]
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.graphml"
+        to_graphml(G, communities, str(out))  # must not raise
+        H = nx.read_graphml(str(out))
+        assert json.loads(H.nodes[a_node]["metadata"]) == {"kind": "file", "size": 12}
+        assert json.loads(H.nodes[a_node]["tags"]) == ["x", "y"]
+        assert json.loads(H.graph["hyperedges"]) == [{"nodes": [a_node], "label": "h"}]
+        assert not (Path(tmp) / "graph.graphml.tmp").exists()
+
+
+def test_to_graphml_preserves_native_scalar_types():
+    """Coercion must leave GraphML-native scalars (int/float/bool/str) untouched,
+    only stringifying non-scalars (#1831)."""
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("a", count=3, ratio=0.5, flag=True, name="x")
+    G.add_node("b")
+    G.add_edge("a", "b")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "g.graphml"
+        to_graphml(G, {0: ["a", "b"]}, str(out))
+        H = nx.read_graphml(str(out))
+        assert H.nodes["a"]["count"] == 3
+        assert H.nodes["a"]["ratio"] == 0.5
+        assert H.nodes["a"]["flag"] is True
+        assert H.nodes["a"]["name"] == "x"
+
+
 def test_to_html_creates_file():
     G = make_graph()
     communities = cluster(G)
@@ -115,6 +316,58 @@ def test_to_html_contains_visjs():
         to_html(G, communities, str(out))
         content = out.read_text()
         assert "vis-network" in content
+
+
+
+def test_to_html_title_uses_portable_path_not_host_absolute():
+    """#2598 / #433: <title> must not embed the generator host absolute path."""
+    import re
+
+    G = make_graph()
+    communities = cluster(G)
+    with tempfile.TemporaryDirectory() as tmp:
+        userish = Path(tmp) / "Users" / "mike" / "proj" / "graphify-out" / "graph.html"
+        userish.parent.mkdir(parents=True)
+        to_html(G, communities, str(userish))
+        html = userish.read_text(encoding="utf-8")
+    m = re.search(r"<title>(.*?)</title>", html)
+    assert m, "expected a <title> tag"
+    title = m.group(1)
+    assert title.startswith("graphify - ")
+    label = title[len("graphify - "):]
+    assert "mike" not in label
+    assert "Users" not in label
+    assert not label.startswith("/")
+    assert "graphify-out/graph.html" in label or label == "graph.html"
+
+
+def test_html_document_title_helper_windows_and_relative():
+    from graphify.exporters.html import _html_document_title
+
+    assert _html_document_title(r"C:\Users\mike\proj\graphify-out\graph.html") == "graphify-out/graph.html"
+    assert _html_document_title("/home/u/proj/graphify-out/graph.html") == "graphify-out/graph.html"
+    assert _html_document_title("graphify-out/graph.html") == "graphify-out/graph.html"
+    assert _html_document_title("/tmp/only/graph.html") == "graph.html"
+
+def test_to_html_neighbor_links_have_no_inline_onclick_xss():
+    """#1838: neighbor links dropped an unescaped JSON.stringify(nid) into a
+    quoted inline onclick — which broke every link (the value's own quotes
+    truncated the attribute) and let a node id/label containing a double-quote
+    (from a document or a scraped `graphify add` URL) inject a live event handler
+    into the local report (stored XSS). The template must instead carry the id in
+    an escaped data attribute and dispatch via one delegated listener."""
+    G = make_graph()
+    communities = cluster(G)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.html"
+        to_html(G, communities, str(out))
+        html = out.read_text()
+    # The vulnerable inline handler is gone entirely...
+    assert 'onclick="focusNode(' not in html
+    assert "JSON.stringify(nid)" not in html
+    # ...replaced by an escaped data attribute + a single delegated listener.
+    assert 'data-nid="${esc(nid)}"' in html
+    assert "closest('.neighbor-link')" in html
 
 
 def test_to_html_pins_visjs_version_with_sri():
@@ -191,6 +444,13 @@ def _vis_nodes_from_html(content: str) -> list:
     return json.loads(m.group(1).replace("<\\/", "</"))
 
 
+def _vis_edges_from_html(content: str) -> list:
+    """Extract the RAW_EDGES JSON array embedded in the generated HTML."""
+    m = re.search(r"const RAW_EDGES = (\[.*?\]);", content, re.DOTALL)
+    assert m, "RAW_EDGES not found in HTML"
+    return json.loads(m.group(1).replace("<\\/", "</"))
+
+
 def test_to_html_annotated_node_gets_learning_status_and_ring():
     """A node with an overlay entry gets learning_status + learning_stale fields,
     a status-colored ring (border), and a Lesson line in its hover title."""
@@ -251,6 +511,72 @@ def test_to_html_unannotated_identical_to_pre_feature():
         cb = b.read_text().replace("b.html", "X.html")
     assert ca == cb
     assert "learning_status" not in ca
+
+
+def test_to_html_tooltips_preserve_special_characters_without_html_entities(tmp_path):
+    """Issue #3664: Node and edge hover tooltips (vis-network title) must preserve
+    raw characters (&, ', ", <, >) without HTML entity escaping (&amp;, &#x27;, etc.)
+    because vis-network renders title via innerText rather than innerHTML."""
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("n1", label="B-Roll & Filming", source_file="src/a.py", community=0)
+    G.add_node("n2", label="Anna's content batching schedule", source_file="src/b.py", community=0)
+    G.add_node("n3", label='<Widget prop="value" & count > 0>', source_file="src/c.py", community=0)
+    G.add_edge("n1", "n2", relation="reviews & approves", confidence="EXTRACTED")
+    G.add_edge("n2", "n3", relation="calls <indirect>", confidence="INFERRED")
+
+    labels = {0: "Team A & Team B"}
+    out = tmp_path / "graph.html"
+    to_html(G, {0: ["n1", "n2", "n3"]}, str(out), community_labels=labels)
+    content = out.read_text(encoding="utf-8")
+
+    nodes = {n["id"]: n for n in _vis_nodes_from_html(content)}
+    assert nodes["n1"]["title"] == "B-Roll & Filming"
+    assert "&amp;" not in nodes["n1"]["title"]
+
+    assert nodes["n2"]["title"] == "Anna's content batching schedule"
+    assert "&#x27;" not in nodes["n2"]["title"]
+    assert "&#39;" not in nodes["n2"]["title"]
+
+    assert nodes["n3"]["title"] == '<Widget prop="value" & count > 0>'
+    for entity in ("&lt;", "&gt;", "&quot;", "&amp;"):
+        assert entity not in nodes["n3"]["title"]
+
+    edges = _vis_edges_from_html(content)
+    edge_map = {(e["from"], e["to"]): e for e in edges}
+    e1 = edge_map[("n1", "n2")]
+    assert e1["title"] == "reviews & approves [EXTRACTED]"
+    assert "&amp;" not in e1["title"]
+
+    e2 = edge_map[("n2", "n3")]
+    assert e2["title"] == "calls <indirect> [INFERRED]"
+    assert "&lt;" not in e2["title"]
+    assert "&gt;" not in e2["title"]
+
+    # In contrast, legend items are injected into innerHTML and MUST remain HTML-escaped.
+    assert "Team A &amp; Team B" in content
+
+
+def test_to_html_learning_overlay_tooltip_preserves_special_characters(tmp_path):
+    """Issue #3664: Node with learning overlay preserves special characters in both
+    the label and lesson text without HTML entity escaping."""
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("n1", label="Anna's & Bob's <Pipeline>", source_file="src/a.py", community=0)
+    overlay = {
+        "n1": {"status": "contested", "uses": 2, "neg": 1, "stale": True}
+    }
+
+    out = tmp_path / "graph.html"
+    to_html(G, {0: ["n1"]}, str(out), learning_overlay=overlay)
+    content = out.read_text(encoding="utf-8")
+
+    nodes = {n["id"]: n for n in _vis_nodes_from_html(content)}
+    title = nodes["n1"]["title"]
+    assert "Anna's & Bob's <Pipeline>\n" in title
+    assert "Lesson: contested (useful 2 / dead-end 1) [code changed — re-verify]" in title
+    for entity in ("&amp;", "&#x27;", "&#39;", "&lt;", "&gt;"):
+        assert entity not in title
 
 
 def test_to_canvas_file_paths_relative_to_vault():
@@ -366,6 +692,46 @@ def test_to_canvas_never_emits_punctuation_only_filenames():
         assert not bad, f"punctuation-only canvas filenames: {bad}"
 
 
+def test_to_obsidian_leading_dot_labels_are_not_hidden_filenames():
+    """#2205: Obsidian hides notes whose names start with `.` — `.env` must
+    become `dot-env.md` (and canvas must point at the same stem)."""
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("n_env", label=".env", source_file=".env", type="document")
+    G.add_node("n_gi", label=".gitignore", source_file=".gitignore", type="document")
+    G.add_node("n_readme", label="README", source_file="README.md", type="document")
+    G.add_edge("n_readme", "n_env", relation="references")
+    communities = {0: ["n_env", "n_gi", "n_readme"]}
+    with tempfile.TemporaryDirectory() as tmp:
+        to_obsidian(G, communities, tmp)
+        stems = {p.stem for p in Path(tmp).rglob("*.md") if not p.name.startswith("_")}
+        assert "dot-env" in stems, stems
+        assert "dot-gitignore" in stems, stems
+        assert not any(s.startswith(".") for s in stems), stems
+
+        canvas = Path(tmp) / "graph.canvas"
+        to_canvas(G, communities, str(canvas))
+        data = json.loads(canvas.read_text(encoding="utf-8"))
+        file_stems = {
+            Path(n["file"]).stem
+            for n in data["nodes"]
+            if n.get("type") == "file"
+        }
+        assert "dot-env" in file_stems, file_stems
+        assert "dot-gitignore" in file_stems, file_stems
+        assert not any(s.startswith(".") for s in file_stems), file_stems
+
+
+def test_obsidian_safe_stem_all_dots_label_falls_back_to_unnamed():
+    """#2205 follow-up: the `dot-` prefix only applies when a word char survives
+    the dot strip. An all-dots label like "..." must hit the #1409 "unnamed"
+    fallback, not produce the meaningless stem "dot-"."""
+    from graphify.export import _obsidian_safe_stem
+    assert _obsidian_safe_stem(".env") == "dot-env"        # #2205 fix unchanged
+    assert _obsidian_safe_stem("...") == "unnamed"         # not "dot-"
+    assert _obsidian_safe_stem("Database") == "Database"   # normal labels untouched
+
+
 # ── Existing-vault safety: graphify must not clobber user notes / .obsidian (#1506) ──
 
 def _two_node_graph():
@@ -416,6 +782,64 @@ def test_to_obsidian_rerun_updates_own_notes_but_not_user_files():
         to_obsidian(G, communities, str(out), community_labels={0: "Backend2"})
         assert (out / "Database.md").exists()  # graphify re-wrote its own
         assert (out / "UserNote.md").read_text().strip() == "mine"  # user's untouched
+
+
+def _four_node_two_community_graph():
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("n1", label="Database", community=0, source_file="app/db.py", type="code")
+    G.add_node("n2", label="Server", community=0, source_file="app/srv.py", type="code")
+    G.add_node("n3", label="Cache", community=1, source_file="infra/cache.py", type="code")
+    G.add_node("n4", label="Queue", community=1, source_file="infra/queue.py", type="code")
+    G.add_edge("n1", "n2")
+    G.add_edge("n3", "n4")
+    return G, {0: ["n1", "n2"], 1: ["n3", "n4"]}
+
+
+def test_to_obsidian_rerun_prunes_removed_nodes():
+    """#1896: re-exporting into the same vault must delete graphify's own notes for
+    nodes (and communities) that dropped out of the graph, so the vault mirrors the
+    current graph rather than old-union-new. User files are never touched."""
+    G4, comm4 = _four_node_two_community_graph()
+    G2, comm2 = _two_node_graph()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "obsidian"
+        to_obsidian(G4, comm4, str(out), community_labels={0: "Backend", 1: "Infra"})
+        assert (out / "Cache.md").exists() and (out / "_COMMUNITY_Infra.md").exists()
+        (out / "MyOwnNote.md").write_text("mine\n", encoding="utf-8")
+        to_obsidian(G2, comm2, str(out), community_labels={0: "Backend"})
+        # notes for removed nodes and the stale community overview are pruned
+        assert not (out / "Cache.md").exists()
+        assert not (out / "Queue.md").exists()
+        assert not (out / "_COMMUNITY_Infra.md").exists()
+        # surviving graphify notes and the user's own note remain
+        assert (out / "Database.md").exists() and (out / "Server.md").exists()
+        assert (out / "_COMMUNITY_Backend.md").exists()
+        assert (out / "MyOwnNote.md").read_text().strip() == "mine"
+
+
+def test_to_obsidian_removed_node_returning_is_writable_again(capsys):
+    """#1896 follow-on: a node that disappears and later returns must be writable
+    again. Before the fix, the manifest was rewritten to only this run's files, so
+    the orphaned note was disowned and the returning node's write was skipped as a
+    'pre-existing user file' forever."""
+    import networkx as nx
+    GA, commA = _two_node_graph()
+    GB = nx.Graph()
+    GB.add_node("n1", label="Database", community=0, source_file="app/db.py", type="code")
+    commB = {0: ["n1"]}
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "obsidian"
+        to_obsidian(GA, commA, str(out), community_labels={0: "Backend"})
+        to_obsidian(GB, commB, str(out), community_labels={0: "Backend"})
+        assert not (out / "Server.md").exists()  # pruned while absent
+        capsys.readouterr()
+        to_obsidian(GA, commA, str(out), community_labels={0: "Backend"})
+        # returned node's note exists with current content, written this run
+        assert (out / "Server.md").exists()
+        assert "# Server" in (out / "Server.md").read_text()
+        captured = capsys.readouterr()
+        assert "skipped" not in captured.err.lower()
 
 
 # ── Case-only-distinct labels must not collide on case-insensitive filesystems ──
@@ -654,3 +1078,310 @@ def test_to_html_handles_null_source_file_and_label(tmp_path):
     out = tmp_path / "graph.html"
     to_html(G, {0: ["n1", "n2", "n3"]}, str(out))
     assert out.exists() and out.stat().st_size > 0
+
+
+def test_existing_graph_node_count(tmp_path):
+    from graphify.export import existing_graph_node_count, MALFORMED_GRAPH
+    p = tmp_path / "graph.json"
+    assert existing_graph_node_count(p) is None            # absent -> nothing to protect
+    p.write_text("", encoding="utf-8")
+    assert existing_graph_node_count(p) is None            # empty -> nothing to protect
+    # Non-empty but unparseable must fail CLOSED (sentinel), matching to_json's
+    # #479 guard — a corrupt/mid-write file could be hiding a complete graph.
+    p.write_text("{not json", encoding="utf-8")
+    assert existing_graph_node_count(p) is MALFORMED_GRAPH  # malformed -> fail closed
+    p.write_text('{"nodes": "notalist"}', encoding="utf-8")
+    assert existing_graph_node_count(p) is MALFORMED_GRAPH  # structurally wrong -> fail closed
+    p.write_text('{"nodes": [{"id": "a"}, {"id": "b"}], "links": []}', encoding="utf-8")
+    assert existing_graph_node_count(p) == 2               # valid
+
+
+def test_hyperedge_perimeter_uses_convex_hull_not_member_order():
+    """The hyperedge polygon must be traced in hull order. Tracing `h.nodes`
+    array order self-intersects whenever the layout does not place members in
+    angular order, so `fill()` paints crossed wedges instead of one region."""
+    from graphify.exporters.html import _hyperedge_script
+    script = _hyperedge_script("[]")
+    assert "function convexHull(pts)" in script
+    assert "const hull = convexHull(positions);" in script
+    # the traced ring must derive from the hull, never from raw member order
+    assert "const expanded = hull.map(" in script
+    assert "const expanded = positions.map(" not in script
+
+
+def test_hyperedge_convex_hull_js_is_geometrically_sound():
+    """Execute the emitted convexHull in node: the perimeter must be simple
+    (no self-intersection), convex, and contain every member point."""
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if node is None:
+        import pytest
+        pytest.skip("node not available")
+    from graphify.exporters.html import _hyperedge_script
+    m = re.search(r"function convexHull\(pts\) \{.*?\n\}", _hyperedge_script("[]"), re.S)
+    assert m, "convexHull not found in emitted script"
+    harness = m.group(0) + r"""
+const cross = (p,q,r) => (q.x-p.x)*(r.y-p.y) - (q.y-p.y)*(r.x-p.x);
+const proper = (a,b,c,d) => {
+  const s = (p,q,r) => Math.sign(cross(p,q,r));
+  return s(a,b,c)*s(a,b,d) < 0 && s(c,d,a)*s(c,d,b) < 0;
+};
+function selfIntersects(poly){
+  const n = poly.length;
+  if (n < 4) return false;
+  for (let i=0;i<n;i++) for (let j=i+1;j<n;j++){
+    if ((i+1)%n===j || (j+1)%n===i) continue;
+    if (proper(poly[i],poly[(i+1)%n],poly[j],poly[(j+1)%n])) return true;
+  }
+  return false;
+}
+let rng = 12345;
+const rnd = () => (rng = (rng*1103515245+12345) & 0x7fffffff) / 0x7fffffff;
+let bad = 0;
+for (let t=0;t<2000;t++){
+  const n = 4 + Math.floor(rnd()*4);            // real hyperedges carry 4-7 members
+  const pts = Array.from({length:n}, () => ({x: rnd()*1000-500, y: rnd()*1000-500}));
+  const h = convexHull(pts);
+  if (selfIntersects(h)) bad++;
+  for (let i=0;i<h.length;i++)                  // convex + counter-clockwise
+    if (cross(h[i], h[(i+1)%h.length], h[(i+2)%h.length]) < -1e-9) bad++;
+  for (const p of pts)                          // every member enclosed
+    for (let i=0;i<h.length;i++)
+      if (cross(h[i], h[(i+1)%h.length], p) < -1e-6) { bad++; break; }
+}
+// degenerate member sets must not throw or produce a crossed ring
+for (const pts of [
+  [{x:-2,y:0},{x:-1,y:0},{x:1,y:0},{x:2,y:0}],
+  [{x:0,y:0},{x:0,y:0},{x:5,y:0},{x:0,y:5}],
+  [{x:3,y:3},{x:3,y:3},{x:3,y:3},{x:3,y:3}],
+  [{x:0,y:0},{x:1,y:1}],
+]) {
+  const h = convexHull(pts);
+  if (!Array.isArray(h) || h.length < 1 || selfIntersects(h)) bad++;
+  if (!h.every(p => Number.isFinite(p.x) && Number.isFinite(p.y))) bad++;
+}
+// the bow-tie ordering this fix exists for
+if (!selfIntersects([{x:-1,y:-1},{x:1,y:1},{x:-1,y:1},{x:1,y:-1}])) bad++;
+if (selfIntersects(convexHull([{x:-1,y:-1},{x:1,y:1},{x:-1,y:1},{x:1,y:-1}]))) bad++;
+console.log(bad);
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        js = Path(tmp) / "hull_check.js"
+        js.write_text(harness, encoding="utf-8")
+        proc = subprocess.run([node, str(js)], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0", f"geometry violations: {proc.stdout.strip()}"
+
+
+def test_to_html_pins_vis_network_version_for_tooltip_xss_boundary():
+    """Tooltip `title` is passed to vis-network as a STRING and rendered via
+    Popup.setText -> innerText (verified in the 9.1.6 bundle), so tooltips are
+    intentionally NOT html-escaped (#3664/#3686). That safety rests on the pin:
+    if vis-network is bumped, the innerText rendering path (the #1838 stored-XSS
+    boundary) must be re-verified. This guard fails CI on a silent bump."""
+    G = make_graph()
+    communities = cluster(G)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.html"
+        to_html(G, communities, str(out))
+        content = out.read_text()
+        assert "vis-network@9.1.6" in content, (
+            "vis-network pin changed — re-verify Popup.setText renders a string "
+            "title via innerText (not innerHTML) before updating this pin, or the "
+            "un-escaped tooltip (#3686) reopens the #1838 stored-XSS boundary"
+        )
+
+
+def test_to_html_spiral_seed_uses_a_real_map_index():
+    """#3699: the Fermat-spiral seed positions reference `i`, so the node map
+    MUST bind an index (`RAW_NODES.map((n, i) => ...)`). Without it the emitted
+    JS throws `ReferenceError: i is not defined` and graph.html fails to render
+    at every graph size. Guards against the free-`i` regression."""
+    G = make_graph()
+    communities = cluster(G)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.html"
+        to_html(G, communities, str(out))
+        content = out.read_text()
+        if "Math.sqrt(i)" in content:  # spiral seed present
+            assert "RAW_NODES.map((n, i)" in content, (
+                "spiral seed references `i` but the node map has no index param "
+                "-> ReferenceError: i is not defined (#3699)"
+            )
+
+
+def test_to_html_canonical_node_schema_mapping(tmp_path):
+    """#3914: nodesDS and showInfo must use canonical un-prefixed field names
+    matching RAW_NODES and Graphify's node schema (file_type, source_file,
+    community_name, degree), eliminating the underscore-prefixed mapping."""
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("n_sample", label="SampleNode", file_type="code", source_file="src/sample.py")
+    out = tmp_path / "graph.html"
+    to_html(G, {0: ["n_sample"]}, str(out), community_labels={0: "Core"})
+    content = out.read_text(encoding="utf-8")
+
+    # RAW_NODES carries canonical un-prefixed fields
+    nodes = {n["id"]: n for n in _vis_nodes_from_html(content)}
+    assert nodes["n_sample"]["file_type"] == "code"
+    assert nodes["n_sample"]["source_file"] == "src/sample.py"
+    assert nodes["n_sample"]["community_name"] == "Core"
+    assert "degree" in nodes["n_sample"]
+
+    # nodesDS dataset mapping must preserve canonical field names
+    assert "file_type: n.file_type" in content
+    assert "source_file: n.source_file" in content
+    assert "community_name: n.community_name" in content
+    assert "degree: n.degree" in content
+
+    # nodesDS must not contain old underscore-prefixed mappings
+    assert "_file_type: n.file_type" not in content
+    assert "_source_file: n.source_file" not in content
+    assert "_community_name: n.community_name" not in content
+    assert "_degree: n.degree" not in content
+    assert "_community: n.community" not in content
+
+    # showInfo must consume canonical fields directly
+    assert "n.file_type" in content
+    assert "n.source_file" in content
+    assert "n.community_name" in content
+    assert "n.degree" in content
+    assert "n._file_type" not in content
+    assert "n._source_file" not in content
+    assert "n._community_name" not in content
+    assert "n._degree" not in content
+
+
+def _run_node_info_harness(html_content: str, target_node_id: str) -> str:
+    """Helper to execute graph.html's client script in Node.js and return #info-content innerHTML."""
+    import re
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if node is None:
+        import pytest
+        pytest.skip("node not available")
+
+    m = re.search(r"<script>(.*?)</script>\s*<script>", html_content, re.DOTALL)
+    assert m, "vis script block not found in html"
+    script = m.group(1)
+
+    harness = f"""
+const mockElem = () => ({{
+  innerHTML: '',
+  style: {{}},
+  appendChild: () => {{}},
+  addEventListener: () => {{}},
+  classList: {{ add: () => {{}}, remove: () => {{}} }},
+  prepend: () => {{}},
+}});
+
+const doc = {{
+  elements: {{
+    'info-content': mockElem(),
+    'graph': mockElem(),
+    'search': mockElem(),
+    'search-results': mockElem(),
+    'select-all-cb': Object.assign(mockElem(), {{ checked: true }}),
+    'legend': mockElem()
+  }},
+  getElementById(id) {{
+    return this.elements[id] || (this.elements[id] = mockElem());
+  }},
+  createElement() {{ return mockElem(); }},
+  addEventListener() {{}},
+  querySelectorAll() {{ return []; }}
+}};
+
+class MockDataSet {{
+  constructor(items) {{
+    this.map = new Map();
+    items.forEach(it => this.map.set(it.id, it));
+  }}
+  get(id) {{ return this.map.get(id); }}
+  update() {{}}
+}}
+
+const vis = {{
+  DataSet: MockDataSet,
+  Network: class {{
+    constructor() {{}}
+    once() {{}}
+    on() {{}}
+    getConnectedNodes() {{ return []; }}
+    focus() {{}}
+    selectNodes() {{}}
+  }}
+}};
+
+const document = doc;
+const window = {{}};
+
+{script}
+
+showInfo('{target_node_id}');
+console.log('OUTPUT:' + doc.getElementById('info-content').innerHTML);
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, f"Node script failed ({proc.returncode}): {proc.stderr}"
+    m_out = re.search(r"OUTPUT:(.*)", proc.stdout)
+    assert m_out, f"OUTPUT not found in stdout: {proc.stdout}"
+    return m_out.group(1)
+
+
+def test_to_html_show_info_runtime_renders_node_fields(tmp_path):
+    """#3914: Execute showInfo in Node.js for a normal node.
+    Type: code and Source: src/sample.py must be rendered into info-content,
+    not Type: unknown or Source: -."""
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("n_sample", label="SampleNode", file_type="code", source_file="src/sample.py")
+    G.add_node("n_other", label="OtherNode", file_type="document", source_file="doc/readme.md")
+    G.add_edge("n_sample", "n_other", relation="references", confidence="EXTRACTED")
+
+    out = tmp_path / "graph.html"
+    to_html(G, {0: ["n_sample", "n_other"]}, str(out), community_labels={0: "Core"})
+    content = out.read_text(encoding="utf-8")
+
+    info_html = _run_node_info_harness(content, "n_sample")
+    assert '<div class="field"><b>SampleNode</b></div>' in info_html
+    assert '<div class="field">Type: code</div>' in info_html
+    assert '<div class="field">Community: Core</div>' in info_html
+    assert '<div class="field">Source: src/sample.py</div>' in info_html
+    assert '<div class="field">Degree: 1</div>' in info_html
+    assert "Type: unknown" not in info_html
+    assert "Source: -" not in info_html
+
+
+def test_to_html_aggregated_community_nodes_runtime(tmp_path):
+    """#3914: Execute showInfo in Node.js for an aggregated community node.
+    Community meta-nodes have no file_type/source_file and must not display
+    misleading Type: unknown or Source: -; they must display community name
+    and member count."""
+    import networkx as nx
+    meta = nx.Graph()
+    meta.add_node("0", label="Core Systems")
+    meta.add_node("1", label="UI Layer")
+    meta.add_edge("0", "1", relation="cross-community", confidence="AGGREGATED")
+
+    out = tmp_path / "graph.html"
+    to_html(
+        meta,
+        {0: ["0"], 1: ["1"]},
+        str(out),
+        community_labels={0: "Core Systems", 1: "UI Layer"},
+        member_counts={0: 25, 1: 10},
+    )
+    content = out.read_text(encoding="utf-8")
+
+    nodes = _vis_nodes_from_html(content)
+    assert any(n.get("member_count") == 25 for n in nodes)
+
+    info_html = _run_node_info_harness(content, "0")
+    assert '<div class="field"><b>Core Systems</b></div>' in info_html
+    assert '<div class="field">Community: Core Systems</div>' in info_html
+    assert '<div class="field">Members: 25</div>' in info_html
+    assert '<div class="field">Degree: 1</div>' in info_html
+    assert "Type: unknown" not in info_html
+    assert "Source: -" not in info_html

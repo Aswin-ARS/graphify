@@ -1,6 +1,7 @@
 """Tests for graphify/prs.py."""
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
@@ -11,10 +12,12 @@ import pytest
 from graphify.prs import (
     PRInfo,
     _classify,
+    _gh,
     _parse_ci,
     _path_match,
     build_community_labels,
     compute_pr_impact,
+    fetch_pr_files,
     fetch_worktrees,
     format_prs_text,
     _detect_default_branch,
@@ -373,6 +376,27 @@ class TestDetectDefaultBranch:
         ):
             assert _detect_default_branch() == "main"
 
+    def test_repo_positional_arg_in_gh_repo_view(self):
+        """gh repo view takes repo positionally; --repo is not a valid flag (#3318)."""
+        with patch(
+            "graphify.prs._gh",
+            return_value={"defaultBranchRef": {"name": "main"}},
+        ) as mock_gh:
+            branch = _detect_default_branch(repo="owner/repo")
+        assert branch == "main"
+        args, _ = mock_gh.call_args
+        assert args == ("repo", "view", "owner/repo", "--json", "defaultBranchRef")
+        assert "--repo" not in args
+
+    def test_explicit_repo_gh_fails_returns_main_without_local_git(self):
+        """When an explicit repo is supplied and gh fails, return 'main' without
+        inspecting the local repository (#3318)."""
+        with patch("graphify.prs._gh", return_value=None), \
+             patch("graphify.prs.subprocess.run") as mock_git:
+            branch = _detect_default_branch(repo="owner/repo")
+        assert branch == "main"
+        mock_git.assert_not_called()
+
 
 # ── build_community_labels ─────────────────────────────────────────────────────
 
@@ -401,3 +425,97 @@ class TestBuildCommunityLabels:
     def test_empty_nodes(self):
         assert build_community_labels({}) == {}
         assert build_community_labels({"nodes": []}) == {}
+
+
+# ── Windows cp1252 subprocess-decode hardening (decode-side sibling of #1505) ──
+
+class TestSubprocessOutputEncoding:
+    """prs.py reads gh/git/claude output via subprocess.run(text=True). Without an
+    explicit encoding= the stdout is decoded with the locale codec (cp1252 on
+    Windows), so non-Latin1 output (emoji, non-ASCII PR titles/logins/paths)
+    fails: the reader thread raises UnicodeDecodeError, subprocess.run returns
+    stdout=None, and the caller then dies on json.loads(None) / None.splitlines().
+    Every call must pass encoding="utf-8" so decoding matches Linux/macOS.
+    #1505 fixed the same defect on the llm.py claude-cli subprocess.
+    """
+
+    _NON_LATIN1 = "docs: add Persian (فارسی) 🏆"
+
+    def test_fixture_is_cp1252_undecodable(self):
+        """Guard: the fixture's UTF-8 bytes must be undecodable as cp1252, else
+        these tests would prove nothing about the failure surface."""
+        raw = self._NON_LATIN1.encode("utf-8")
+        with pytest.raises(UnicodeDecodeError):
+            raw.decode("cp1252")
+        assert raw.decode("utf-8") == self._NON_LATIN1
+
+    def test_gh_decodes_output_as_utf8(self):
+        completed = MagicMock(
+            returncode=0, stdout=json.dumps([{"title": self._NON_LATIN1}]), stderr=""
+        )
+        with patch("subprocess.run", return_value=completed) as mock_run:
+            data = _gh("pr", "list", "--json", "title")
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("encoding") == "utf-8", (
+            f"_gh subprocess must use encoding='utf-8'; got {kwargs.get('encoding')!r}"
+        )
+        assert data == [{"title": self._NON_LATIN1}]
+
+    def test_fetch_pr_files_decodes_output_as_utf8(self):
+        completed = MagicMock(returncode=0, stdout="src/café.py\n", stderr="")
+        with patch("subprocess.run", return_value=completed) as mock_run:
+            fetch_pr_files(1)
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("encoding") == "utf-8"
+
+    def test_fetch_worktrees_decodes_output_as_utf8(self):
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=completed) as mock_run:
+            fetch_worktrees()
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("encoding") == "utf-8"
+
+    def test_detect_default_branch_decodes_output_as_utf8(self):
+        # Force the git symbolic-ref fallback: gh returns None -> git subprocess runs.
+        completed = MagicMock(returncode=0, stdout="refs/remotes/origin/v8\n", stderr="")
+        with patch("graphify.prs._gh", return_value=None), \
+             patch("subprocess.run", return_value=completed) as mock_run:
+            _detect_default_branch()
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("encoding") == "utf-8"
+
+
+# ── Subprocess stdin isolation (#3318) ─────────────────────────────────────────
+
+class TestSubprocessStdinIsolation:
+    """Subprocesses in prs.py must isolate stdin with subprocess.DEVNULL so they
+    never inherit an open stdin pipe from the MCP stdio server (#3318)."""
+
+    def test_gh_passes_devnull_stdin(self):
+        completed = MagicMock(returncode=0, stdout="[]", stderr="")
+        with patch("subprocess.run", return_value=completed) as mock_run:
+            _gh("repo", "view")
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("stdin") == subprocess.DEVNULL
+
+    def test_fetch_pr_files_passes_devnull_stdin(self):
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=completed) as mock_run:
+            fetch_pr_files(1)
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("stdin") == subprocess.DEVNULL
+
+    def test_fetch_worktrees_passes_devnull_stdin(self):
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=completed) as mock_run:
+            fetch_worktrees()
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("stdin") == subprocess.DEVNULL
+
+    def test_detect_default_branch_git_fallback_passes_devnull_stdin(self):
+        completed = MagicMock(returncode=0, stdout="refs/remotes/origin/main\n", stderr="")
+        with patch("graphify.prs._gh", return_value=None), \
+             patch("subprocess.run", return_value=completed) as mock_run:
+            _detect_default_branch()
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("stdin") == subprocess.DEVNULL

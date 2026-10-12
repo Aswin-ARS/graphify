@@ -5,12 +5,14 @@ from graphify.exporters.base import COMMUNITY_COLORS  # noqa: E402,F401
 from pathlib import Path
 import html as _html
 from graphify.analyze import _node_community_map
+from graphify.paths import write_text_atomic
 import json
 import networkx as nx
 from graphify.security import sanitize_label
 
 
 MAX_NODES_FOR_VIZ = 5_000
+_HTML_STALE_MARKER = ".graph.html.stale"
 
 def _viz_node_limit() -> int:
     """Return the effective viz node limit, honoring GRAPHIFY_VIZ_NODE_LIMIT env var.
@@ -73,6 +75,27 @@ def _hyperedge_script(hyperedges_json: str) -> str:
 const hyperedges = {hyperedges_json};
 // afterDrawing passes ctx already transformed to network coordinate space.
 // Draw node positions raw — no manual pan/zoom/DPR math needed.
+
+// Andrew's monotone chain. Returns the hull in counter-clockwise order, which
+// is what the perimeter must be traced in. Collinear and duplicate points
+// collapse to the extremes, so degenerate member sets render as a segment
+// rather than a zero-area crossed path.
+function convexHull(pts) {{
+    const p = pts.slice().sort((a, b) => (a.x - b.x) || (a.y - b.y));
+    if (p.length < 3) return p;
+    const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    const build = seq => {{
+        const out = [];
+        for (const q of seq) {{
+            while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], q) <= 0) out.pop();
+            out.push(q);
+        }}
+        out.pop();
+        return out;
+    }};
+    const hull = build(p).concat(build(p.slice().reverse()));
+    return hull.length >= 3 ? hull : p;
+}}
 network.on('afterDrawing', function(ctx) {{
     hyperedges.forEach(h => {{
         const positions = h.nodes
@@ -85,10 +108,14 @@ network.on('afterDrawing', function(ctx) {{
         ctx.strokeStyle = '#6366f1';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        // Centroid and expanded hull in network coordinates
+        // Centroid and expanded hull in network coordinates.
+        // The perimeter must follow hull order, not h.nodes order: tracing the
+        // raw member order self-intersects whenever the layout does not happen
+        // to place members in angular order, filling as crossed wedges.
         const cx = positions.reduce((s, p) => s + p.x, 0) / positions.length;
         const cy = positions.reduce((s, p) => s + p.y, 0) / positions.length;
-        const expanded = positions.map(p => ({{
+        const hull = convexHull(positions);
+        const expanded = hull.map(p => ({{
             x: cx + (p.x - cx) * 1.15,
             y: cy + (p.y - cy) * 1.15
         }}));
@@ -121,11 +148,18 @@ function esc(s) {{
 }}
 
 // Build vis datasets
-const nodesDS = new vis.DataSet(RAW_NODES.map(n => ({{
+const nodesDS = new vis.DataSet(RAW_NODES.map((n, i) => ({{
   id: n.id, label: n.label, color: n.color, size: n.size,
   font: n.font, title: n.title,
-  _community: n.community, _community_name: n.community_name,
-  _source_file: n.source_file, _file_type: n.file_type, _degree: n.degree,
+  // Fermat/golden-angle spiral seed positions (#3699): spreading nodes out
+  // before physics runs keeps avoidOverlap from computing near-zero-distance
+  // repulsion that blows the BarnesHut recursion into a stack overflow on large
+  // graphs. `i` is the map index — physics still settles small graphs identically.
+  x: 30 * Math.sqrt(i) * Math.cos(i * 2.4),
+  y: 30 * Math.sqrt(i) * Math.sin(i * 2.4),
+  community: n.community, community_name: n.community_name,
+  source_file: n.source_file, file_type: n.file_type, degree: n.degree,
+  member_count: n.member_count,
 }})));
 
 const edgesDS = new vis.DataSet(RAW_EDGES.map((e, i) => ({{
@@ -175,16 +209,24 @@ function showInfo(nodeId) {{
   const neighborItems = neighborIds.map(nid => {{
     const nb = nodesDS.get(nid);
     const color = nb ? nb.color.background : '#555';
-    return `<span class="neighbor-link" style="border-left-color:${{esc(color)}}" onclick="focusNode(${{JSON.stringify(nid)}})">${{esc(nb ? nb.label : nid)}}</span>`;
+    return `<span class="neighbor-link" style="border-left-color:${{esc(color)}}" data-nid="${{esc(nid)}}">${{esc(nb ? nb.label : nid)}}</span>`;
   }}).join('');
-  document.getElementById('info-content').innerHTML = `
-    <div class="field"><b>${{esc(n.label)}}</b></div>
-    <div class="field">Type: ${{esc(n._file_type || 'unknown')}}</div>
-    <div class="field">Community: ${{esc(n._community_name)}}</div>
-    <div class="field">Source: ${{esc(n._source_file || '-')}}</div>
-    <div class="field">Degree: ${{n._degree}}</div>
-    ${{neighborIds.length ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{neighborIds.length}})</div><div id="neighbors-list">${{neighborItems}}</div>` : ''}}
-  `;
+  const isMetaNode = !n.file_type && !n.source_file;
+  let html = `<div class="field"><b>${{esc(n.label)}}</b></div>`;
+  if (!isMetaNode) {{
+    html += `<div class="field">Type: ${{esc(n.file_type || 'unknown')}}</div>`;
+  }}
+  html += `<div class="field">Community: ${{esc(n.community_name || '')}}</div>`;
+  if (!isMetaNode) {{
+    html += `<div class="field">Source: ${{esc(n.source_file || '-')}}</div>`;
+  }} else if (n.member_count !== undefined && n.member_count !== null) {{
+    html += `<div class="field">Members: ${{esc(n.member_count)}}</div>`;
+  }}
+  html += `<div class="field">Degree: ${{n.degree}}</div>`;
+  if (neighborIds.length) {{
+    html += `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{neighborIds.length}})</div><div id="neighbors-list">${{neighborItems}}</div>`;
+  }}
+  document.getElementById('info-content').innerHTML = html;
 }}
 
 function focusNode(nodeId) {{
@@ -192,6 +234,19 @@ function focusNode(nodeId) {{
   network.selectNodes([nodeId]);
   showInfo(nodeId);
 }}
+
+// Neighbor links use a data attribute + one delegated listener rather than an
+// inline onclick. A node id/label sourced from a document or a scraped URL
+// (graphify add) can contain a double-quote; dropping the stringified id
+// unescaped into a quoted onclick both broke every link and allowed a hostile
+// source to inject an event handler into the local report (stored XSS, #1838).
+// esc() on data-nid keeps the value inside the attribute; the listener reads it
+// back verbatim. Bound to document so it survives the innerHTML rebuild that
+// recreates #neighbors-list on each showInfo().
+document.addEventListener('click', e => {{
+  const el = e.target.closest('.neighbor-link');
+  if (el && el.dataset.nid !== undefined) focusNode(el.dataset.nid);
+}});
 
 // Track hovered node — hover detection is more reliable than click params
 let hoveredNodeId = null;
@@ -309,6 +364,50 @@ LEGEND.forEach(c => {{
 }});
 </script>"""
 
+
+def _html_document_title(output_path: str) -> str:
+    """Return a portable label for the graph.html <title>.
+
+    Tracked artifacts must not embed the generator host absolute path
+    (regression of #433; reported again as #2598 on Windows). Keep from the
+    configured output-dir bare name (``graphify-out`` / ``GRAPHIFY_OUT``
+    basename) onward — portable in every case; otherwise fall back to a
+    cwd-relative label, and finally the filename only.
+    """
+    from graphify.paths import GRAPHIFY_OUT_NAME
+
+    raw = str(output_path).replace("\\", "/")
+    # Drop Windows drive prefix so Path parts are comparable on any OS.
+    if len(raw) >= 3 and raw[1] == ":" and raw[0].isalpha() and raw[2] == "/":
+        raw = raw[2:]  # "/Users/..." style after drive strip
+    p = Path(raw)
+
+    parts = list(Path(raw).parts)
+    # Path("C:/Users/..") on POSIX may keep "C:" as first part — strip it.
+    if parts and len(parts[0]) == 2 and parts[0][1] == ":" and parts[0][0].isalpha():
+        parts = parts[1:]
+    # Prefer keeping from the output-dir marker onward: portable in every
+    # case, whereas a cwd-relative path still leaks host/user segments when
+    # the graph is built from a directory ABOVE the project (#2598 follow-up).
+    marker = GRAPHIFY_OUT_NAME
+    for i, part in enumerate(parts):
+        if part == marker or part.startswith("graphify-out"):
+            return "/".join(parts[i:])
+
+    # No standard out-dir marker (fully custom output path): fall back to a
+    # cwd-relative label when the target is under cwd, else the bare filename.
+    try:
+        resolved = p if p.is_absolute() else (Path.cwd() / p)
+        rel = resolved.resolve().relative_to(Path.cwd().resolve())
+        label = rel.as_posix()
+        if label and label != ".":
+            return label
+    except (ValueError, OSError, RuntimeError):
+        pass
+
+    name = p.name
+    return name if name else "graph.html"
+
 def to_html(
     G: nx.Graph,
     communities: dict[int, list[str]],
@@ -317,7 +416,7 @@ def to_html(
     member_counts: dict[int, int] | None = None,
     node_limit: int | None = None,
     learning_overlay: dict | None = None,
-) -> None:
+) -> bool:
     """Generate an interactive vis.js HTML visualization of the graph.
 
     Features: node size by degree, click-to-inspect panel, search box,
@@ -329,6 +428,9 @@ def to_html(
 
     If node_limit is set and the graph exceeds it, automatically builds an
     aggregated community-level meta-graph instead of raising ValueError.
+
+    Returns True when the output was written. Returns False when an aggregated
+    view would contain fewer than two communities and is intentionally skipped.
     """
     limit = node_limit if node_limit is not None else _viz_node_limit()
     if G.number_of_nodes() > limit:
@@ -351,7 +453,7 @@ def to_html(
                               relation=f"{w} cross-community edges", confidence="AGGREGATED")
             if meta.number_of_nodes() <= 1:
                 print("Single community - aggregated view not useful. Skipping graph.html.")
-                return
+                return False
             meta_communities = {cid: [str(cid)] for cid in communities}
             mc = {cid: len(members) for cid, members in communities.items()}
             # Remap hyperedges from semantic node IDs to community IDs
@@ -378,11 +480,13 @@ def to_html(
                         "nodes": comm_ids,
                     })
                 meta.graph["hyperedges"] = remapped
-            to_html(meta, meta_communities, output_path,
-                    community_labels=community_labels, member_counts=mc)
+            written = to_html(meta, meta_communities, output_path,
+                              community_labels=community_labels, member_counts=mc)
+            if not written:
+                return False
             print(f"graph.html written (aggregated: {meta.number_of_nodes()} community nodes, {meta.number_of_edges()} cross-community edges)")
             print("Tip: run with --obsidian for full node-level detail.")
-            return
+            return True
         raise ValueError(
             f"Graph has {G.number_of_nodes()} nodes - too large for HTML viz "
             f"(limit: {limit}). Use --no-viz, raise GRAPHIFY_VIZ_NODE_LIMIT, "
@@ -430,13 +534,24 @@ def to_html(
             "color": {"background": color, "border": color, "highlight": {"background": "#ffffff", "border": color}},
             "size": round(size, 1),
             "font": {"size": font_size, "color": "#ffffff"},
-            "title": _html.escape(label),
+            # Tooltip `title` is a STRING, which vis-network renders via
+            # Popup.setText -> `frame.innerText = t` (verified in the pinned
+            # 9.1.6 bundle: the only non-Element branch is innerText, and the
+            # bundle has zero `innerHTML = <var>` sinks). So raw special chars
+            # are shown literally and must NOT be html-escaped here or the user
+            # sees `&amp;`/`&lt;` in the tooltip (#3664/#3686). This is the
+            # #1838 stored-XSS boundary: never pass an HTMLElement as `title`,
+            # and do not change the vis-network pin below without re-checking
+            # Popup rendering (the test_export version-pin guard enforces this).
+            "title": label,
             "community": cid,
             "community_name": sanitize_label((community_labels or {}).get(cid, f"Community {cid}")),
             "source_file": sanitize_label(str(data.get("source_file") or "")),
             "file_type": data.get("file_type", ""),
             "degree": deg,
         }
+        if member_counts:
+            node["member_count"] = member_counts.get(cid, len(communities.get(cid, [])))
         # Conditional learning fields — only present for annotated nodes, so
         # un-annotated output keeps the exact pre-feature node dict shape.
         entry = learning_overlay.get(str(node_id)) if learning_overlay else None
@@ -466,7 +581,7 @@ def to_html(
                 lesson = f"Lesson: {status} ({entry.get('uses', 0)} useful)"
             if stale:
                 lesson += " [code changed — re-verify]"
-            node["title"] = _html.escape(label) + "\n" + _html.escape(sanitize_label(lesson))
+            node["title"] = f"{label}\n{sanitize_label(lesson)}"
         vis_nodes.append(node)
 
     # Build edges list. Restore original edge direction from _src/_tgt
@@ -483,7 +598,7 @@ def to_html(
             "from": true_src,
             "to": true_tgt,
             "label": relation,
-            "title": _html.escape(f"{relation} [{confidence}]"),
+            "title": sanitize_label(f"{relation} [{confidence}]"),
             "dashes": confidence != "EXTRACTED",
             "width": 2 if confidence == "EXTRACTED" else 1,
             "color": {"opacity": 0.7 if confidence == "EXTRACTED" else 0.35},
@@ -498,15 +613,19 @@ def to_html(
         n = member_counts.get(cid, len(communities.get(cid, []))) if member_counts else len(communities.get(cid, []))
         legend_data.append({"cid": cid, "color": color, "label": lbl, "count": n})
 
-    # Escape </script> sequences so embedded JSON cannot break out of the script tag
+    # Escape every `<` as < so embedded JSON cannot break out of the <script>
+    # element. Escaping only `</` is not enough: an unclosed `<!--` then a later
+    # `<script` in a label drive the HTML tokenizer into script-data-double-escaped
+    # state, where the real `</script>` no longer closes the tag and the page goes
+    # blank (#4124). `<` round-trips through JSON.parse, so labels render unchanged.
     def _js_safe(obj) -> str:
-        return json.dumps(obj).replace("</", "<\\/")
+        return json.dumps(obj).replace("<", "\\u003c")
 
     nodes_json = _js_safe(vis_nodes)
     edges_json = _js_safe(vis_edges)
     legend_json = _js_safe(legend_data)
     hyperedges_json = _js_safe(getattr(G, "graph", {}).get("hyperedges", []))
-    title = _html.escape(sanitize_label(str(output_path)))
+    title = _html.escape(sanitize_label(_html_document_title(output_path)))
     stats = f"{G.number_of_nodes()} nodes &middot; {G.number_of_edges()} edges &middot; {len(communities)} communities"
 
     html = f"""<!DOCTYPE html>
@@ -544,4 +663,5 @@ def to_html(
 </body>
 </html>"""
 
-    Path(output_path).write_text(html, encoding="utf-8")  # nosec
+    write_text_atomic(output_path, html)
+    return True
